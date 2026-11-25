@@ -1,4 +1,4 @@
-import { getSupabase, Profile } from './supabase';
+import { getSupabase, ParsedResume, Profile } from './supabase';
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:7860').replace(/\/$/, '');
 
@@ -30,4 +30,8 @@ export async function api<T = any>(path: string, body?: unknown): Promise<T> {
 }
 
 /** The subset of the profile the backend needs. */
-export const apiProfile = (p: Profile) => ({ role: p.role, level: p.level, skills: p.skills });
+export const apiProfile = (p: Profile) => ({ role: p.role, level: p.level, track: p.track || 'general', skills: p.skills.slice(0, 60) });
+
+/** The parts of the resume used for resume deep-dive and portfolio questions. */
+export const apiResume = (r: ParsedResume | null | undefined) =>
+  r ? { experience: r.experience.slice(0, 10), projects: r.projects.slice(0, 10), achievements: r.achievements.slice(0, 12) } : null;
