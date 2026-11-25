@@ -19,7 +19,15 @@ from resume import EXTRACTION_PROMPT, ResumeError, clean_text, extract_text, nor
 from tracks import ROUNDS, TRACKS, round_or_default, track_or_default
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Groq retired Llama for non-enterprise accounts (Aug 2026). GPT-OSS models are available on the free/developer plan.
+# GROQ_MODEL is tried first, then each of GROQ_FALLBACK_MODELS (comma separated) if a model is retired or unavailable.
+GROQ_MODELS = list(dict.fromkeys(
+    m.strip()
+    for m in (os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b") + "," + os.environ.get("GROQ_FALLBACK_MODELS", "openai/gpt-oss-20b")).split(",")
+    if m.strip()
+))
+GROQ_MODEL = GROQ_MODELS[0]
+GROQ_REASONING_EFFORT = os.environ.get("GROQ_REASONING_EFFORT", "low")  # low | medium | high (GPT-OSS only)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
@@ -73,33 +81,107 @@ async def current_user(authorization: str = Header(default="")) -> str:
 
 
 # ---------------------------------------------------------------- Groq
-async def groq(messages: list[dict], json_mode: bool = True, temperature: float = 0.4, max_tokens: int = 1500):
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Server is missing GROQ_API_KEY")
-    body = {"model": GROQ_MODEL, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
+_unavailable_models: set[str] = set()  # models Groq reported as retired / not allowed; skipped until restart
+_MODEL_GONE_CODES = ("model_decommissioned", "model_not_found", "model_terminated", "model_permission_blocked")
+
+
+def _model_params(model: str, max_tokens: int, plain: bool) -> dict:
+    """Per-model request settings. Reasoning models think before answering and those tokens count toward
+    max_completion_tokens, so they get extra room. `plain` drops reasoning settings (used if a model rejects them)."""
+    m = model.lower()
+    if plain:
+        return {"max_completion_tokens": max_tokens}
+    if "gpt-oss" in m:
+        return {"reasoning_effort": GROQ_REASONING_EFFORT, "include_reasoning": False, "max_completion_tokens": max_tokens + 3000}
+    if "qwen" in m:
+        return {"reasoning_effort": "none", "max_completion_tokens": max_tokens}
+    return {"max_completion_tokens": max_tokens}
+
+
+def _groq_error(r: httpx.Response) -> tuple[str, str]:
     try:
-        r = await http.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json=body,
-        )
-    except httpx.HTTPError:
-        raise HTTPException(502, "Couldn't reach the AI service. Please retry.")
-    if r.status_code == 429:
-        raise HTTPException(429, "AI free-tier limit reached. Try again in a minute.")
-    if r.status_code == 401:
-        raise HTTPException(500, "The server's GROQ_API_KEY is invalid.")
-    if r.status_code != 200:
-        raise HTTPException(502, f"AI service error ({r.status_code})")
-    text = r.json()["choices"][0]["message"]["content"]
-    if not json_mode:
-        return text
+        e = r.json().get("error", {})
+        return str(e.get("code") or e.get("type") or ""), str(e.get("message") or "")
+    except Exception:
+        return "", r.text[:300]
+
+
+def _parse_json(text: str):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise HTTPException(502, "AI returned an invalid response, please retry")
+        start, end = text.find("{"), text.rfind("}")  # tolerate stray text around the object
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+async def groq(messages: list[dict], json_mode: bool = True, temperature: float = 0.4, max_tokens: int = 1500):
+    """Call Groq. Tries each configured model in order, skipping retired ones, and retries once on an
+    empty, cut-off or invalid-JSON answer. max_tokens is the budget for the visible answer."""
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Server is missing GROQ_API_KEY")
+    models = [m for m in GROQ_MODELS if m not in _unavailable_models] or GROQ_MODELS
+    problem = "AI service error"
+    for model in models:
+        plain = False
+        for attempt in range(3):
+            body = {"model": model, "messages": messages, "temperature": temperature,
+                    **_model_params(model, max_tokens * (2 if attempt else 1), plain)}
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+            try:
+                r = await http.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json=body,
+                )
+            except httpx.HTTPError:
+                raise HTTPException(502, "Couldn't reach the AI service. Please retry.")
+
+            if r.status_code == 429:
+                raise HTTPException(429, "AI free-tier limit reached. Try again in a minute.")
+            if r.status_code == 401:
+                raise HTTPException(500, "The server's GROQ_API_KEY is invalid.")
+            if r.status_code != 200:
+                code, msg = _groq_error(r)
+                low = f"{code} {msg}".lower()
+                if any(c in low for c in _MODEL_GONE_CODES) or "decommission" in low or (
+                    "model" in low and ("does not exist" in low or "not have access" in low)
+                ):
+                    _unavailable_models.add(model)  # retired or not allowed on this plan: try the next model
+                    problem = f"AI model {model} is unavailable"
+                    break
+                if not plain and r.status_code == 400 and ("reasoning" in low or "max_completion_tokens" in low):
+                    plain = True  # this model doesn't accept the reasoning settings: retry without them
+                    continue
+                if "json_validate_failed" in low or "failed to generate json" in low:
+                    problem = "AI returned an invalid response"
+                    continue  # retry, with a bigger budget
+                if r.status_code >= 500:
+                    problem = f"AI service error ({r.status_code})"
+                    break  # try the next model
+                raise HTTPException(502, f"AI request was rejected ({r.status_code}). {msg[:160]}".strip())
+
+            choice = r.json()["choices"][0]
+            text = (choice.get("message") or {}).get("content") or ""
+            if not text.strip():
+                problem = "AI returned an empty response"  # usually ran out of tokens while reasoning
+                continue
+            if not json_mode:
+                return text
+            parsed = _parse_json(text)
+            if isinstance(parsed, dict):
+                return parsed
+            problem = "AI returned an invalid response"
+    if all(m in _unavailable_models for m in GROQ_MODELS):
+        _unavailable_models.clear()  # let a later request re-check, in case it was temporary
+        raise HTTPException(500, "None of the server's AI models are available. Set GROQ_MODEL in the Space settings "
+                                 "to a model listed at console.groq.com/docs/models.")
+    raise HTTPException(502, f"{problem}. Please retry.")
 
 
 # ---------------------------------------------------------------- models
@@ -167,7 +249,8 @@ def who(p: Profile) -> str:
 # ---------------------------------------------------------------- routes
 @app.get("/")
 def health():
-    return {"ok": True, "service": "PrepPilot API", "model": GROQ_MODEL}
+    active = [m for m in GROQ_MODELS if m not in _unavailable_models]
+    return {"ok": True, "service": "PrepPilot API", "model": active[0] if active else GROQ_MODEL, "models": GROQ_MODELS}
 
 
 @app.post("/resume/parse")

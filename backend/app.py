@@ -17,7 +17,7 @@ except ImportError:  # running outside Hugging Face
 import gradio as gr
 import uvicorn
 
-from main import GROQ_API_KEY, GROQ_MODEL, SUPABASE_ANON_KEY, SUPABASE_URL, app as api
+from main import GROQ_API_KEY, GROQ_MODELS, SUPABASE_ANON_KEY, SUPABASE_URL, app as api
 
 if spaces is not None:
 
@@ -37,7 +37,7 @@ def status() -> str:
         f"- `GROQ_API_KEY` (secret): {mark(bool(GROQ_API_KEY))}\n"
         f"- `SUPABASE_URL`: {mark(bool(SUPABASE_URL))}\n"
         f"- `SUPABASE_ANON_KEY`: {mark(bool(SUPABASE_ANON_KEY))}\n"
-        f"- Model: `{GROQ_MODEL}`\n\n"
+        f"- Models (tried in order): {', '.join(f'`{m}`' for m in GROQ_MODELS)}\n\n"
         "This Space is the backend for the PrepPilot website. It has no UI of its own."
     )
 
