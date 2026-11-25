@@ -1,0 +1,4 @@
+# Gradio Spaces already include gradio, fastapi, uvicorn, httpx and python-multipart.
+# Only the extra packages for reading resumes are listed here, so nothing conflicts with Gradio's versions.
+pypdf==5.1.0
+python-docx==1.1.2
